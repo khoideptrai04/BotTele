@@ -1,65 +1,90 @@
+"""
+Bot Telegram + Flask Web Server
+Dành cho Render.com Free Tier & Local Run
+"""
+
 import os
 import requests
 import pytz
+import asyncio
+import threading
+import logging
 from datetime import datetime, timedelta, time
+from flask import Flask, jsonify
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler
 
-# --- CẤU HÌNH ---
-TELEGRAM_TOKEN = '8528236957:AAHNIePz7oNObe8qvoy6bMyVfb5UVnS6tww'
-FOOTBALL_API_KEY = 'de6f2a649b5b49419e4fec624319d0ef'
+# --- CẤU HÌNH LOGGING (Để xem lỗi rõ hơn) ---
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 
-# Để lấy chat_id: gõ /id trong nhóm khi bot đã join
-CHAT_ID_FOR_AUTO_SCHEDULE = None  # VD: -1001234567890
+# --- CẤU HÌNH TOKEN & API ---
+# Ưu tiên lấy từ biến môi trường, nếu không có thì dùng key cứng (để test local)
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '8528236957:AAHNIePz7oNObe8qvoy6bMyVfb5UVnS6tww')
+FOOTBALL_API_KEY = os.getenv('FOOTBALL_API_KEY', 'de6f2a649b5b49419e4fec624319d0ef')
+
+# Xử lý CHAT_ID: Ép kiểu sang int an toàn để tránh lỗi Pylance
+raw_chat_id = os.getenv('CHAT_ID', "-1003621081160")
+try:
+    CHAT_ID_FOR_AUTO_SCHEDULE = int(raw_chat_id)
+except (ValueError, TypeError):
+    CHAT_ID_FOR_AUTO_SCHEDULE = -1003621081160
+
+PORT = int(os.getenv('PORT', 10000))  # Render dùng PORT từ ENV
 
 BASE_URL = "https://api.football-data.org/v4"
 
-# Giải đấu FREE TIER (12 giải)
+# Danh sách giải đấu muốn theo dõi (theo mã của football-data.org)
 COMPETITIONS = {
-    'PL': 'Premier League',       # Anh
-    'PD': 'La Liga',               # Tây Ban Nha
-    'BL1': 'Bundesliga',           # Đức
-    'SA': 'Serie A',               # Ý
-    'FL1': 'Ligue 1',              # Pháp
-    'CL': 'Champions League',      # Châu Âu
-    'ELC': 'Championship',         # Anh 2
-    'PPL': 'Primeira Liga',        # Bồ Đào Nha
-    'DED': 'Eredivisie',           # Hà Lan
-    'BSA': 'Série A',              # Brazil
-    'EC': 'European Championship', # Euro
-    'WC': 'World Cup'              # World Cup (khi có)
+    'PL': 'Premier League',
+    'PD': 'La Liga',
+    'BL1': 'Bundesliga',
+    'SA': 'Serie A',
+    'FL1': 'Ligue 1',
+    'CL': 'Champions League'
 }
 
-# NOTE: Nếu muốn thêm J-League, K-League, A-League:
-# - Cần nâng cấp lên TIER_TWO (~€19/tháng)
-# - Hoặc dùng API-Football (cần VPN)
+# Biến toàn cục lưu trạng thái
+tracked_matches = {}
+announced_goals = set()
 
-# Lưu trữ
-tracked_matches = {}  # {match_id: match_info} - Các trận trong lịch hôm nay
-announced_goals = set()  # Bàn thắng đã thông báo
+# --- Flask App (Để Render không sleep) ---
+flask_app = Flask(__name__)
 
-# --- HÀM GỌI API ---
+@flask_app.route('/')
+def home():
+    return jsonify({
+        'status': 'online',
+        'bot': 'Football Bot',
+        'uptime': 'running'
+    })
+
+@flask_app.route('/health')
+def health():
+    return jsonify({'status': 'healthy', 'tracked_matches': len(tracked_matches)})
+
+# --- Football API Functions ---
 def call_api(endpoint):
     """Gọi API football-data.org"""
     url = f"{BASE_URL}{endpoint}"
     headers = {'X-Auth-Token': FOOTBALL_API_KEY}
-    
     try:
         response = requests.get(url, headers=headers, timeout=10)
         if response.status_code == 200:
             return response.json()
-        else:
-            print(f"API Error {response.status_code}: {response.text}")
-            return None
+        print(f"API Error {response.status_code}: {response.text}")
+        return None
     except Exception as e:
-        print(f"Request Error: {e}")
+        print(f"Exception calling API: {e}")
         return None
 
-# --- HÀM LẤY LỊCH HÔM NAY ---
 def get_today_matches():
-    """Lấy lịch thi đấu hôm nay và lưu vào tracked_matches"""
+    """Lấy lịch hôm nay và lưu vào tracked_matches"""
     global tracked_matches
-    tracked_matches.clear()  # Reset danh sách
+    # Xóa cache cũ
+    tracked_matches.clear()
     
     tz_vn = pytz.timezone('Asia/Ho_Chi_Minh')
     today = datetime.now(tz_vn).date()
@@ -67,32 +92,40 @@ def get_today_matches():
     date_from = today.strftime("%Y-%m-%d")
     date_to = (today + timedelta(days=1)).strftime("%Y-%m-%d")
     
+    # Gọi API lấy tất cả trận đấu
     data = call_api(f"/matches?dateFrom={date_from}&dateTo={date_to}")
     
     if not data or not data.get('matches'):
-        return "📅 Hôm nay chưa có lịch thi đấu."
+        return f"📅 Hôm nay ({date_from}) không có dữ liệu lịch thi đấu."
     
-    message = f"⚽ *LỊCH THI ĐẤU HÔM NAY ({date_from})*\n\n"
+    message = f"⚽ *LỊCH THI ĐẤU ({date_from})*\n\n"
+    has_match = False
     
-    # Nhóm theo giải
+    # Nhóm trận đấu theo giải
     matches_by_comp = {}
-    for match in data['matches']:
-        comp_name = match['competition']['name']
-        match_id = match['id']
-        
-        # Lưu vào danh sách theo dõi
-        tracked_matches[match_id] = {
-            'home': match['homeTeam']['name'],
-            'away': match['awayTeam']['name'],
-            'competition': comp_name,
-            'utcDate': match['utcDate']
-        }
-        
-        if comp_name not in matches_by_comp:
-            matches_by_comp[comp_name] = []
-        matches_by_comp[comp_name].append(match)
     
-    # Hiển thị
+    for match in data['matches']:
+        comp_code = match['competition']['code']
+        # Chỉ lấy các giải HOT
+        if comp_code in COMPETITIONS:
+            has_match = True
+            comp_name = match['competition']['name']
+            match_id = match['id']
+            
+            # Lưu vào bộ nhớ để theo dõi Live Score
+            tracked_matches[match_id] = {
+                'home': match['homeTeam']['name'],
+                'away': match['awayTeam']['name'],
+                'competition': comp_name
+            }
+            
+            if comp_name not in matches_by_comp:
+                matches_by_comp[comp_name] = []
+            matches_by_comp[comp_name].append(match)
+    
+    if not has_match:
+        return "📅 Hôm nay không có trận nào thuộc các giải lớn (NHA, C1, La Liga...)."
+
     for comp_name, matches in matches_by_comp.items():
         message += f"🏆 *{comp_name}*\n"
         for match in matches:
@@ -103,346 +136,166 @@ def get_today_matches():
             message += f"⏰ {vn_time} | {home} 🆚 {away}\n"
         message += "\n"
     
-    message += f"📊 Tổng: *{len(tracked_matches)} trận*\n"
-    message += "🔔 Bot sẽ tự động thông báo bàn thắng!"
-    
+    message += f"📊 Đã thêm *{len(tracked_matches)} trận* vào danh sách theo dõi Live."
     return message
 
-# --- HÀM QUÉT BÀN THẮNG (CHỈ THEO DÕI TRẬN TRONG LỊCH) ---
+# --- Telegram Bot Handlers ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message:
+        await update.message.reply_text(
+            "👋 *Bot Bóng Đá Ready*\n"
+            "/lich - Xem lịch & Nạp dữ liệu trận đấu\n"
+            "/watch - Bật thông báo bàn thắng\n"
+            "/id - Lấy ID nhóm",
+            parse_mode='Markdown'
+        )
+
+async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message and update.effective_chat:
+        chat_id = update.effective_chat.id
+        await update.message.reply_text(f"🆔 Chat ID: `{chat_id}`", parse_mode='Markdown')
+
+async def lich(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message: return
+    await update.message.reply_text("🔄 Đang tải lịch thi đấu...")
+    result = get_today_matches()
+    await update.message.reply_text(result, parse_mode='Markdown')
+
 async def check_goals_auto(context: ContextTypes.DEFAULT_TYPE):
-    """Quét bàn thắng - CHỈ các trận trong lịch hôm nay"""
-    if not context.job or not context.job.chat_id:
-        return
+    """Hàm chạy ngầm quét bàn thắng"""
+    if not context.job or not context.job.chat_id: return
     
     chat_id = context.job.chat_id
     
+    # Nếu chưa có danh sách trận đấu, thử lấy lại
     if not tracked_matches:
-        print("[AUTO] Chưa có trận nào được theo dõi")
-        return
+        get_today_matches()
+        if not tracked_matches: return # Vẫn không có thì thôi
+
+    # Lấy các trận đang đá (IN_PLAY) hoặc Tạm dừng (PAUSED)
+    data = call_api("/matches?status=IN_PLAY") # Có thể thêm ,PAUSED nếu muốn
     
-    # Lấy danh sách trận đang live
-    data = call_api("/matches?status=IN_PLAY")
-    
-    if not data or not data.get('matches'):
-        return
+    if not data or not data.get('matches'): return
     
     for match in data['matches']:
         match_id = match['id']
         
-        # CHỈ theo dõi trận có trong lịch hôm nay
-        if match_id not in tracked_matches:
-            continue
-        
-        home = match['homeTeam']['name']
-        away = match['awayTeam']['name']
-        score_home = match['score']['fullTime']['home'] or 0
-        score_away = match['score']['fullTime']['away'] or 0
-        
-        goal_id = f"{match_id}_{score_home}_{score_away}"
-        
-        if goal_id not in announced_goals and (score_home > 0 or score_away > 0):
-            # Tính phút
-            utc_time = datetime.fromisoformat(match['utcDate'].replace('Z', '+00:00'))
-            now = datetime.now(pytz.UTC)
-            elapsed = int((now - utc_time).total_seconds() / 60)
-            elapsed = min(elapsed, 95)  # Cap tối đa 95'
+        # Chỉ báo tin nếu trận đấu nằm trong danh sách theo dõi
+        if match_id in tracked_matches:
+            home_name = match['homeTeam']['name']
+            away_name = match['awayTeam']['name']
+            score_home = match['score']['fullTime']['home']
+            score_away = match['score']['fullTime']['away']
             
-            text = f"⚽ *VÀOOOOO !!!* ({elapsed}')\n\n"
-            text += f"🏆 {match['competition']['name']}\n"
-            text += f"🔥 *{home} {score_home} - {score_away} {away}*"
+            # Xử lý trường hợp API trả về None
+            if score_home is None: score_home = 0
+            if score_away is None: score_away = 0
             
-            print(f"[GOAL] {home} {score_home}-{score_away} {away}")
+            # Tạo ID bàn thắng: IDTran_BanThangNha_BanThangKhach
+            goal_id = f"{match_id}_{score_home}_{score_away}"
             
-            try:
-                await context.bot.send_message(chat_id=chat_id, text=text, parse_mode='Markdown')
-                announced_goals.add(goal_id)
-            except Exception as e:
-                print(f"Error sending goal: {e}")
+            # Logic: Tỉ số thay đổi -> Báo tin
+            if goal_id not in announced_goals:
+                # Không báo 0-0
+                if score_home == 0 and score_away == 0:
+                    continue
+                
+                comp_name = match['competition']['name']
+                minute = "Live" # API Free đôi khi không trả về phút chính xác
+                
+                text = (
+                    f"⚽ *VÀOOOOO !!!*\n\n"
+                    f"🏆 {comp_name}\n"
+                    f"🔥 *{home_name} {score_home} - {score_away} {away_name}*"
+                )
+                
+                try:
+                    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode='Markdown')
+                    announced_goals.add(goal_id)
+                except Exception as e:
+                    print(f"Lỗi gửi tin nhắn: {e}")
 
-# --- LỆNH /start ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message:
-        await update.message.reply_text(
-            "👋 *Chào mừng! Bot Bóng Đá 24/7*\n\n"
-            "📋 *DANH SÁCH LỆNH:*\n"
-            "/lich - Xem lịch hôm nay\n"
-            "/live - Xem tỉ số trực tiếp\n"
-            "/watch - Bật theo dõi bàn thắng\n"
-            "/stopwatch - Tắt theo dõi\n"
-            "/bang PL - Xem bảng xếp hạng\n"
-            "/id - Xem Chat ID (để cấu hình auto)\n"
-            "/info - Thông tin API\n\n"
-            "🤖 *TÍNH NĂNG TỰ ĐỘNG:*\n"
-            "• Gửi lịch lúc 8h sáng mỗi ngày\n"
-            "• Thông báo bàn thắng tự động",
-            parse_mode='Markdown'
-        )
-
-# --- LỆNH /id (Lấy Chat ID) ---
-async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message and update.effective_chat:
-        chat_id = update.effective_chat.id
-        chat_type = update.effective_chat.type
-        await update.message.reply_text(
-            f"📊 *THÔNG TIN CHAT*\n\n"
-            f"Chat ID: `{chat_id}`\n"
-            f"Loại: {chat_type}\n\n"
-            f"💡 Copy Chat ID này vào code để bật auto schedule!",
-            parse_mode='Markdown'
-        )
-
-# --- LỆNH /lich ---
-async def lich(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-    
-    await update.message.reply_text("🔄 Đang lấy lịch...")
-    result = get_today_matches()
-    await update.message.reply_text(result, parse_mode='Markdown')
-
-# --- LỆNH /live ---
-async def live(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-    
-    await update.message.reply_text("🔄 Đang lấy tỉ số...")
-    
-    data = call_api("/matches?status=IN_PLAY")
-    
-    if not data or not data.get('matches'):
-        await update.message.reply_text("⚽ Hiện không có trận nào đang live!")
-        return
-    
-    # Lọc chỉ trận trong lịch (nếu có)
-    live_matches = []
-    for match in data['matches']:
-        if tracked_matches and match['id'] not in tracked_matches:
-            continue  # Skip trận không trong lịch
-        live_matches.append(match)
-    
-    if not live_matches:
-        await update.message.reply_text("⚽ Không có trận nào trong lịch hôm nay đang live!")
-        return
-    
-    message = "🔴 *TỈ SỐ TRỰC TIẾP*\n\n"
-    
-    for match in live_matches:
-        comp_name = match['competition']['name']
-        home = match['homeTeam']['name']
-        away = match['awayTeam']['name']
-        score_home = match['score']['fullTime']['home'] or 0
-        score_away = match['score']['fullTime']['away'] or 0
-        
-        utc_time = datetime.fromisoformat(match['utcDate'].replace('Z', '+00:00'))
-        now = datetime.now(pytz.UTC)
-        elapsed = int((now - utc_time).total_seconds() / 60)
-        elapsed = min(elapsed, 95)
-        
-        message += f"🏆 {comp_name}\n"
-        message += f"⏱ *{elapsed}'* | {home} *{score_home} - {score_away}* {away}\n\n"
-    
-    await update.message.reply_text(message, parse_mode='Markdown')
-
-# --- LỆNH /bang ---
-async def bang(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-    
-    comp_code = context.args[0].upper() if context.args else 'PL'
-    
-    if comp_code not in COMPETITIONS:
-        await update.message.reply_text(f"❌ Giải '{comp_code}' không hợp lệ!")
-        return
-    
-    await update.message.reply_text(f"🔄 Đang lấy bảng xếp hạng...")
-    
-    data = call_api(f"/competitions/{comp_code}/standings")
-    
-    if not data or not data.get('standings'):
-        await update.message.reply_text("❌ Không lấy được dữ liệu!")
-        return
-    
-    standings = data['standings'][0]['table']
-    comp_name = data['competition']['name']
-    
-    message = f"🏆 *{comp_name.upper()}*\n\n"
-    
-    for team in standings[:10]:
-        pos = team['position']
-        name = team['team']['name']
-        points = team['points']
-        played = team['playedGames']
-        
-        emoji = "🥇" if pos == 1 else "🥈" if pos == 2 else "🥉" if pos == 3 else f"{pos}."
-        message += f"{emoji} {name} - *{points}* điểm ({played} trận)\n"
-    
-    await update.message.reply_text(message, parse_mode='Markdown')
-
-# --- LỆNH /watch ---
 async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_chat or not update.message:
-        return
+    if not update.effective_chat or not update.message: return
     
     if not context.job_queue:
-        await update.message.reply_text("❌ Lỗi job queue")
+        await update.message.reply_text("❌ Lỗi JobQueue không hoạt động.")
         return
     
     chat_id = update.effective_chat.id
+    job_name = f"watch_{chat_id}"
     
-    # Xóa job cũ
-    current_jobs = context.job_queue.get_jobs_by_name(f"watch_{chat_id}")
-    for job in current_jobs:
-        job.schedule_removal()
+    # Xóa job cũ để tránh trùng lặp
+    current_jobs = context.job_queue.get_jobs_by_name(job_name)
+    for job in current_jobs: job.schedule_removal()
     
-    # Tạo job mới: quét mỗi 120s
+    # Chạy 120s (2 phút) một lần để tiết kiệm API
     context.job_queue.run_repeating(
         check_goals_auto, 
         interval=120, 
         first=10, 
         chat_id=chat_id, 
-        name=f"watch_{chat_id}"
+        name=job_name
     )
     
-    await update.message.reply_text(
-        "🔔 Đã bật theo dõi bàn thắng!\n\n"
-        "💡 Bot chỉ theo dõi các trận trong lịch hôm nay.\n"
-        "Dùng /lich để load danh sách trận."
-    )
+    await update.message.reply_text(f"🔔 Đã bật theo dõi tỉ số cho nhóm `{chat_id}` (Quét 2 phút/lần).", parse_mode='Markdown')
 
-# --- LỆNH /stopwatch ---
-async def stopwatch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_chat or not update.message:
-        return
-    
-    if not context.job_queue:
-        return
-    
-    chat_id = update.effective_chat.id
-    current_jobs = context.job_queue.get_jobs_by_name(f"watch_{chat_id}")
-    
-    if not current_jobs:
-        await update.message.reply_text("❌ Chưa bật theo dõi!")
-        return
-    
-    for job in current_jobs:
-        job.schedule_removal()
-    
-    await update.message.reply_text("⏸️ Đã tắt theo dõi bàn thắng!")
-
-# --- LỆNH /info ---
-async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message:
-        info_text = (
-            "ℹ️ *THÔNG TIN API*\n\n"
-            "🌐 API: football-data.org\n"
-            "📦 Plan: Free Tier\n"
-            "⚡ Limit: 10 req/phút\n"
-            "🏆 Giải: 12 giải miễn phí\n\n"
-            "*Giải có sẵn:*\n"
-            "PL, PD, BL1, SA, FL1, CL, ELC, PPL, DED, BSA\n\n"
-            "❌ *Không có:* J-League, K-League, A-League\n"
-            "💰 Cần nâng cấp TIER_TWO (~€19/tháng)\n\n"
-            "🌐 https://football-data.org"
-        )
-        await update.message.reply_text(info_text, parse_mode='Markdown')
-
-# --- TỰ ĐỘNG GỬI LỊCH LÚC 8H SÁNG ---
 async def send_daily_schedule(context: ContextTypes.DEFAULT_TYPE):
     """Gửi lịch tự động lúc 8h sáng"""
-    if not context.job or not context.job.chat_id:
-        return
-    
+    if not context.job or not context.job.chat_id: return
     chat_id = context.job.chat_id
     
-    print(f"[AUTO] Gửi lịch hàng ngày tới {chat_id}")
-    
-    result = get_today_matches()
-    
+    msg = get_today_matches()
     try:
-        await context.bot.send_message(
-            chat_id=chat_id, 
-            text="🌅 *LỊCH THI ĐẤU HÔM NAY*\n\n" + result, 
-            parse_mode='Markdown'
-        )
-        
+        await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
         # Tự động bật watch sau khi gửi lịch
-        current_jobs = context.job_queue.get_jobs_by_name(f"watch_{chat_id}")
-        if not current_jobs:
-            context.job_queue.run_repeating(
-                check_goals_auto, 
-                interval=120, 
-                first=10, 
-                chat_id=chat_id, 
-                name=f"watch_{chat_id}"
-            )
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="🔔 Đã tự động bật theo dõi bàn thắng!"
-            )
+        if context.job_queue:
+            job_name = f"watch_{chat_id}"
+            jobs = context.job_queue.get_jobs_by_name(job_name)
+            if not jobs:
+                context.job_queue.run_repeating(check_goals_auto, interval=120, first=60, chat_id=chat_id, name=job_name)
     except Exception as e:
-        print(f"Error sending daily schedule: {e}")
+        print(f"Lỗi gửi lịch tự động: {e}")
 
-# --- CHẠY BOT ---
-if __name__ == '__main__':
-    from telegram.request import HTTPXRequest
+# --- Main Run ---
+async def main():
+    print(f"✅ Đang khởi động Bot...")
     
-    # Kiểm tra config
-    if FOOTBALL_API_KEY == 'YOUR_FOOTBALL_DATA_ORG_API_KEY':
-        print("❌ Chưa cấu hình FOOTBALL_API_KEY!")
-        print("👉 Đăng ký tại: https://www.football-data.org/client/register")
-        exit(1)
+    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     
-    if TELEGRAM_TOKEN == 'YOUR_TELEGRAM_BOT_TOKEN_HERE':
-        print("❌ Chưa cấu hình TELEGRAM_TOKEN!")
-        exit(1)
-    
-    # Setup
-    request = HTTPXRequest(
-        connection_pool_size=8,
-        connect_timeout=30.0,
-        read_timeout=30.0,
-        write_timeout=30.0,
-        pool_timeout=30.0
-    )
-    
-    application = ApplicationBuilder().token(TELEGRAM_TOKEN).request(request).build()
-    
-    # Handlers
+    # Thêm Handlers
     application.add_handler(CommandHandler('start', start))
     application.add_handler(CommandHandler('id', get_id))
     application.add_handler(CommandHandler('lich', lich))
-    application.add_handler(CommandHandler('live', live))
-    application.add_handler(CommandHandler('bang', bang))
     application.add_handler(CommandHandler('watch', watch))
-    application.add_handler(CommandHandler('stopwatch', stopwatch))
-    application.add_handler(CommandHandler('info', info))
     
-    # Tự động gửi lịch lúc 8h sáng mỗi ngày
+    # Auto Schedule (Chỉ chạy nếu có CHAT_ID hợp lệ)
     if CHAT_ID_FOR_AUTO_SCHEDULE and application.job_queue:
         tz_vn = pytz.timezone('Asia/Ho_Chi_Minh')
+        # Gửi vào lúc 8h00 sáng mỗi ngày
         application.job_queue.run_daily(
             send_daily_schedule,
             time=time(hour=8, minute=0, tzinfo=tz_vn),
             chat_id=CHAT_ID_FOR_AUTO_SCHEDULE,
             name="daily_schedule"
         )
-        print(f"✅ Đã cấu hình auto gửi lịch lúc 8h sáng cho chat {CHAT_ID_FOR_AUTO_SCHEDULE}")
-    elif not CHAT_ID_FOR_AUTO_SCHEDULE:
-        print("⚠️ Chưa cấu hình CHAT_ID_FOR_AUTO_SCHEDULE")
-        print("💡 Gõ /id trong nhóm để lấy Chat ID")
-    else:
-        print("❌ Lỗi: job_queue không khả dụng")
+        print(f"📅 Đã đặt lịch gửi tự động cho ID: {CHAT_ID_FOR_AUTO_SCHEDULE}")
     
-    print("🚀 Bot đang khởi động...")
-    print("🌐 API: football-data.org (Free Tier - 12 giải)")
+    print("🚀 Bot đang chạy polling...")
+    # Sửa lỗi 'None is not awaitable' bằng cách gọi đúng hàm async
+    await application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+def run_flask():
+    """Chạy Flask server"""
+    flask_app.run(host='0.0.0.0', port=PORT, use_reloader=False)
+
+if __name__ == '__main__':
+    # 1. Chạy Flask ở luồng riêng (Daemon Thread)
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
     
+    # 2. Chạy Bot Telegram (Main Thread)
     try:
-        application.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-            poll_interval=2.0
-        )
+        asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n⚠️ Bot đã dừng")
-    except Exception as e:
-        print(f"❌ Lỗi: {e}")
+        print("🛑 Đã dừng Bot.")
