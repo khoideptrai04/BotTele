@@ -1,0 +1,16 @@
+python-telegram-bot==20.7
+requests==2.31.0
+pytz==2023.3
+```
+
+**📄 `Procfile`:**
+```
+worker: python BaiDu.py
+```
+
+**📄 `.gitignore`:**
+```
+__pycache__/
+*.pyc
+.env
+.vscode/
